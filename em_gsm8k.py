@@ -171,9 +171,10 @@ def train_rl(
     batch_size=4,        # number of questions per batch
     num_trajectories=3,  # replicates per question
     wandb_project="gsm8k_rl",
-    model_name='Qwen/Qwen2.5-1.5B-Instruct'
+    model_name='Qwen/Qwen2.5-1.5B-Instruct',
+    beta=0.03
 ):
-    wandb.init(project=wandb_project, name="gsm8k_reinforce")
+    wandb.init(project=wandb_project, name='gsm8k_em')
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     # Load and split dataset.
@@ -202,12 +203,12 @@ def train_rl(
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     
     # Create reference model copy (frozen).
-    #reference_model = copy.deepcopy(train_model)
-    #reference_model.eval()
-    #for param in reference_model.parameters():
-    #    param.requires_grad = False
+    reference_model = copy.deepcopy(train_model)
+    reference_model.eval()
+    for param in reference_model.parameters():
+        param.requires_grad = False
 
-    optimizer = AdamW(train_model.parameters(), lr=5e-7)
+    optimizer = AdamW(train_model.parameters(), lr=1e-6)
     
     # Initialize vLLM instance (for generation).
     vllm_instance = LLM(model_name, max_num_seqs=1024, gpu_memory_utilization=0.25)
@@ -219,13 +220,16 @@ def train_rl(
     print(f"Initial Test Accuracy: {test_accuracy:.4f}")
     
     global_step = 0
+    total_reward = 0.0
 
     for epoch in range(1, epochs+1):
         print(f"\nEpoch {epoch}")
         for batch_idx, batch in enumerate(train_loader):
             # Prepare lists to store prompts, prompt lengths, and ground truths.
-            prompt_list = []
-            prompt_lengths = []
+            prior_prompt_list = []
+            prior_prompt_lengths = []
+            post_prompt_list = []
+            post_prompt_lengths = []
             ground_truths = []
             
             for item in batch:
@@ -233,23 +237,37 @@ def train_rl(
                 gt = item["ground_truth"]
                 ground_truths.append(gt)
                 for _ in range(num_trajectories):
-                    prompt = build_prompt(question, posterior_cot=False)
-                    prompt_list.append(prompt)
+                    # Prior
+                    prior_prompt = build_prompt(question, posterior_cot=False)
+                    prior_prompt_list.append(prior_prompt)
                     # Compute prompt token length.
-                    tokenized = tokenizer(prompt, return_tensors='pt')
-                    prompt_lengths.append(tokenized.input_ids.shape[-1])
+                    tokenized = tokenizer(prior_prompt, return_tensors='pt')
+                    prior_prompt_lengths.append(tokenized.input_ids.shape[-1])
+                    #Posterior
+                    post_prompt = build_prompt(question, posterior_cot=True, ground_truth=gt)
+                    post_prompt_list.append(post_prompt)
+                    # Compute prompt token length.
+                    tokenized = tokenizer(post_prompt, return_tensors='pt')
+                    post_prompt_lengths.append(tokenized.input_ids.shape[-1])
             
             # Generate trajectories in batch via vLLM.
-            messages = [[{"role": "user", "content": prompt}] for prompt in prompt_list]
-            requests = [tokenizer.apply_chat_template(message, tokenize=False, add_generation_prompt=True)
+            messages = [[{"role": "user", "content": prompt}] for prompt in prior_prompt_list]
+            prior_requests = [tokenizer.apply_chat_template(message, tokenize=False, add_generation_prompt=True)
                         for message in messages]
-            for m in range(len(requests)):
-                tokenized = tokenizer(requests[m], return_tensors='pt')
-                prompt_lengths[m] = tokenized.input_ids.shape[-1]
+            messages = [[{"role": "user", "content": prompt}] for prompt in post_prompt_list]
+            post_requests = [tokenizer.apply_chat_template(message, tokenize=False, add_generation_prompt=True)
+                        for message in messages]
+            for m in range(len(prior_requests)):
+                tokenized = tokenizer(prior_requests[m], return_tensors='pt')
+                prior_prompt_lengths[m] = tokenized.input_ids.shape[-1]
+                tokenized = tokenizer(post_requests[m], return_tensors='pt')
+                post_prompt_lengths[m] = tokenized.input_ids.shape[-1]
             sampling_params = SamplingParams(temperature=0.7, max_tokens=1024)
-            responses = vllm_instance.generate(requests, sampling_params=sampling_params)
+            responses = vllm_instance.generate(post_requests, sampling_params=sampling_params)
             generated_texts = [response.outputs[0].text.strip() for response in responses]
-            full_texts = [base_prompt + gen_text for base_prompt, gen_text in zip(requests, generated_texts)]
+            # Generate full prior and post texts
+            prior_texts = [base_prompt + gen_text for base_prompt, gen_text in zip(prior_requests, generated_texts)]
+            post_texts = [base_prompt + gen_text for base_prompt, gen_text in zip(post_requests, generated_texts)]
 
             # Compute rewards (processing each generated sample string).
             rewards = []
@@ -263,37 +281,62 @@ def train_rl(
             
             rewards_tensor = torch.tensor(rewards, device=train_model.device, dtype=torch.float)
             rewards_tensor = rewards_tensor.view(len(batch), num_trajectories)
-            # Compute baseline (average reward per question) and advantage.
-            baseline = rewards_tensor.mean(dim=1, keepdim=True)
-            advantages = (rewards_tensor - baseline)
+            total_reward = total_reward + rewards_tensor.mean()
             
-            # Compute log probabilities in batch (vectorized computation).
-            # This returns a tensor of shape (batch_size * num_trajectories,)
+            # Prior log probs
+            with torch.no_grad():
+                prior_log_probs = compute_log_prob_batch(train_model, tokenizer, prior_texts, prior_prompt_lengths)
+                prior_log_probs = prior_log_probs.view(len(batch), num_trajectories)
+
+            # E-step loss
+            E_loss_total = 0.0
+            kl_total = 0.0
             for b in range(len(batch)):
-                batch_log_probs = compute_log_prob_batch(train_model, tokenizer, full_texts[b*num_trajectories:(b+1)*num_trajectories], prompt_lengths[b*num_trajectories:(b+1)*num_trajectories])
-                batch_log_probs = batch_log_probs.view(num_trajectories)
+                post_log_probs = compute_log_prob_batch(train_model, tokenizer, post_texts[b*num_trajectories:(b+1)*num_trajectories], post_prompt_lengths[b*num_trajectories:(b+1)*num_trajectories])
+                post_log_probs = post_log_probs.view(num_trajectories)
                 
                 # Compute the REINFORCE loss.
-                loss = - (advantages[b] * batch_log_probs).mean()
-                loss.backward()
+                kl = post_log_probs.detach() - prior_log_probs[b]
+                entropy_reward = rewards_tensor[b] - beta * (kl)
+                baseline = entropy_reward.mean()
+                advantages = (entropy_reward - baseline)
+                E_loss = - (advantages * post_log_probs).mean()
+                E_loss.backward()
+                E_loss_total = E_loss_total + E_loss.item()
+                kl_total = kl_total + kl.mean()
             
-            # Update parameters immediately after processing the batch.
+            # Update parameters with E-step
             optimizer.step()
             optimizer.zero_grad()
+            
+            # M-step loss
+            M_loss_total = 0.0
+            for b in range(len(batch)):
+                prior_log_probs = compute_log_prob_batch(train_model, tokenizer, prior_texts[b*num_trajectories:(b+1)*num_trajectories], prior_prompt_lengths[b*num_trajectories:(b+1)*num_trajectories])
+                prior_log_probs = prior_log_probs.view(num_trajectories)
+                
+                # Fiter out wrong answers and maximize log prob for rest
+                M_loss = - (prior_log_probs).mean()
+                M_loss.backward()
+                M_loss_total = M_loss_total + M_loss.item()
+                
+            # Update parameters with M-step
+            optimizer.step()
+            optimizer.zero_grad()
+                
             global_step += 1
 
-            wandb.log({"train_loss": loss.item(), "global_step": global_step})
-            print(f"Step {global_step}: Loss {loss.item():.4f}")
+            wandb.log({"E_loss": E_loss_total/len(batch), "M_loss": M_loss_total/len(batch), "Total_loss": (E_loss_total + M_loss_total)/len(batch), "kl": kl_total/len(batch), "global_step": global_step})
+            #print(f"Step {global_step}: Loss {loss.item():.4f}")
 
             llmp = vllm_instance.llm_engine.model_executor.driver_worker.model_runner.model
             llmp.load_weights(train_model.named_parameters())
 
-            if global_step % 10 == 0:
-                avg_reward = rewards_tensor.mean().item()
-                avg_log_prob = batch_log_probs.mean().item()
+            if (global_step) % 10 == 0:
+                avg_reward = total_reward/10
+                total_reward = 0.0
                 wandb.log({
                     "avg_reward": avg_reward,
-                    "avg_log_prob": avg_log_prob,
                     "step": global_step,
                 })
 
@@ -315,6 +358,7 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=6, help="Batch size (number of questions per batch).")
     parser.add_argument("--num_trajectories", type=int, default=5, help="Number of trajectories per question.")
     parser.add_argument("--wandb_project", type=str, default="gsm8k_rl", help="wandb project name.")
+    parser.add_argument("--beta", type=float, default=1.0, help="KL term weight for E-step")
     parser.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-1.5B-Instruct", help="Pretrained model name.")
     
     args = parser.parse_args()
@@ -324,5 +368,6 @@ if __name__ == "__main__":
         batch_size=args.batch_size,
         num_trajectories=args.num_trajectories,
         wandb_project=args.wandb_project,
-        model_name=args.model_name
+        model_name=args.model_name,
+        beta=args.beta
     )
