@@ -3,6 +3,7 @@ import torch
 import torch.nn.functional as F
 import copy
 import json
+import numpy as np
 import re
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer, AdamW
@@ -10,6 +11,7 @@ from vllm import LLM, SamplingParams
 import wandb
 from torch.utils.data import DataLoader, Dataset
 from sklearn.model_selection import train_test_split
+import matplotlib.pyplot as plt
 
 # ----------------------------
 # Helper functions
@@ -26,6 +28,12 @@ def extract_answer(text):
         except ValueError:
             return None
     return None
+
+def expand_histogram(counts, bin_edges):
+    """Convert histogram bin counts back into raw samples (bin centers repeated by count)."""
+    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+    expanded = np.repeat(bin_centers, counts)
+    return expanded
 
 def enforce_answer_format(text):
     """
@@ -172,7 +180,8 @@ def train_rl(
     num_trajectories=3,  # replicates per question
     wandb_project="gsm8k_rl",
     model_name='Qwen/Qwen2.5-1.5B-Instruct',
-    beta=0.03
+    beta=0.03,
+    importance_weights=False
 ):
     wandb.init(project=wandb_project, name='gsm8k_em')
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -203,15 +212,18 @@ def train_rl(
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     
     # Create reference model copy (frozen).
-    reference_model = copy.deepcopy(train_model)
-    reference_model.eval()
-    for param in reference_model.parameters():
-        param.requires_grad = False
+    posterior_model = copy.deepcopy(train_model)
+    #reference_model = copy.deepcopy(train_model)
+    #reference_model.eval()
+    #for param in reference_model.parameters():
+    #    param.requires_grad = False
 
-    optimizer = AdamW(train_model.parameters(), lr=1e-6)
+    #optimizer = AdamW(train_model.parameters(), lr=1e-6)
+    E_optimizer = AdamW(posterior_model.parameters(), lr=1e-6)
+    M_optimizer = AdamW(train_model.parameters(), lr=1e-6)
     
     # Initialize vLLM instance (for generation).
-    vllm_instance = LLM(model_name, max_num_seqs=1024, gpu_memory_utilization=0.25)
+    vllm_instance = LLM(model_name, max_num_seqs=1024, gpu_memory_utilization=0.2)
     
     # Pre-training evaluation.
     print("Evaluating on test set (pre-training)...")
@@ -221,6 +233,10 @@ def train_rl(
     
     global_step = 0
     total_reward = 0.0
+    if importance_weights:
+        accum_min_hist = np.zeros(10, dtype=int)
+        accum_max_hist = np.zeros(10, dtype=int)
+        bin_edges = np.linspace(0, 1, 11)
 
     for epoch in range(1, epochs+1):
         print(f"\nEpoch {epoch}")
@@ -282,6 +298,8 @@ def train_rl(
             rewards_tensor = torch.tensor(rewards, device=train_model.device, dtype=torch.float)
             rewards_tensor = rewards_tensor.view(len(batch), num_trajectories)
             total_reward = total_reward + rewards_tensor.mean()
+            if importance_weights:
+                iw_tensor = torch.zeros_like(rewards_tensor, device=train_model.device)
             
             # Prior log probs
             with torch.no_grad():
@@ -292,7 +310,8 @@ def train_rl(
             E_loss_total = 0.0
             kl_total = 0.0
             for b in range(len(batch)):
-                post_log_probs = compute_log_prob_batch(train_model, tokenizer, post_texts[b*num_trajectories:(b+1)*num_trajectories], post_prompt_lengths[b*num_trajectories:(b+1)*num_trajectories])
+                #post_log_probs = compute_log_prob_batch(train_model, tokenizer, post_texts[b*num_trajectories:(b+1)*num_trajectories], post_prompt_lengths[b*num_trajectories:(b+1)*num_trajectories])
+                post_log_probs = compute_log_prob_batch(posterior_model, tokenizer, post_texts[b*num_trajectories:(b+1)*num_trajectories], post_prompt_lengths[b*num_trajectories:(b+1)*num_trajectories])
                 post_log_probs = post_log_probs.view(num_trajectories)
                 
                 # Compute the REINFORCE loss.
@@ -304,10 +323,13 @@ def train_rl(
                 E_loss.backward()
                 E_loss_total = E_loss_total + E_loss.item()
                 kl_total = kl_total + kl.mean()
+                # Compute importance weights.
+                if importance_weights:
+                    iw_tensor[b] = torch.softmax(entropy_reward, dim=0)
             
             # Update parameters with E-step
-            optimizer.step()
-            optimizer.zero_grad()
+            E_optimizer.step()
+            E_optimizer.zero_grad()
             
             # M-step loss
             M_loss_total = 0.0
@@ -316,13 +338,24 @@ def train_rl(
                 prior_log_probs = prior_log_probs.view(num_trajectories)
                 
                 # Fiter out wrong answers and maximize log prob for rest
-                M_loss = - (prior_log_probs).mean()
+                if importance_weights:
+                    M_loss = - (iw_tensor[b] * prior_log_probs).sum()#mean()
+                else:
+                    M_loss = - (rewards_tensor[b] * prior_log_probs).mean()
                 M_loss.backward()
                 M_loss_total = M_loss_total + M_loss.item()
                 
             # Update parameters with M-step
-            optimizer.step()
-            optimizer.zero_grad()
+            M_optimizer.step()
+            M_optimizer.zero_grad()
+            
+            # Accumulate min and max importance weights for logging
+            if importance_weights:
+                iw_tensor = iw_tensor.detach().cpu().numpy()
+                min_iw = iw_tensor.min(axis=1)
+                max_iw = iw_tensor.max(axis=1)
+                accum_min_hist += np.histogram(min_iw, bins=bin_edges)[0]
+                accum_max_hist += np.histogram(max_iw, bins=bin_edges)[0]
                 
             global_step += 1
 
@@ -330,7 +363,7 @@ def train_rl(
             #print(f"Step {global_step}: Loss {loss.item():.4f}")
 
             llmp = vllm_instance.llm_engine.model_executor.driver_worker.model_runner.model
-            llmp.load_weights(train_model.named_parameters())
+            llmp.load_weights(posterior_model.named_parameters())#(train_model.named_parameters())
 
             if (global_step) % 10 == 0:
                 avg_reward = total_reward/10
@@ -340,11 +373,38 @@ def train_rl(
                     "step": global_step,
                 })
 
-            if global_step % 100 == 0:
+            if global_step % 50 == 0:
+                # Log importance weights histogram
+                if importance_weights:
+                    fig, ax = plt.subplots(figsize=(10, 6))
+                    width = (bin_edges[1] - bin_edges[0]) * 0.4
+                    bins_center = (bin_edges[:-1] + bin_edges[1:]) / 2
+                    
+                    # Plot side-by-side bar charts for min and max histograms.
+                    ax.bar(bins_center - width, accum_min_hist, width=width, alpha=0.7, label='Min Weights')
+                    ax.bar(bins_center + width, accum_max_hist, width=width, alpha=0.7, label='Max Weights')
+                    
+                    ax.set_xlabel("Importance Weight Value (Quantized Bins)")
+                    ax.set_ylabel("Accumulated Count")
+                    ax.set_title(f"Accumulated Histograms for Min and Max Importance Weights")
+                    ax.legend()
+                    ax.grid(True)
+                    plt.tight_layout()
+                    
+                    # Log the figure to wandb as an image
+                    wandb.log({"iw_histogram_plot": wandb.Image(fig)})
+                    plt.close(fig)
+                    accum_min_hist = np.zeros(10, dtype=int)
+                    accum_max_hist = np.zeros(10, dtype=int)
+                
                 # End-of-epoch evaluation.
+                llmp = vllm_instance.llm_engine.model_executor.driver_worker.model_runner.model
+                llmp.load_weights(train_model.named_parameters())
                 test_accuracy = evaluate_test(test_loader, vllm_instance, tokenizer, posterior_cot=False)
                 wandb.log({"epoch": epoch, "test_accuracy": test_accuracy})
                 print(f"Epoch {epoch} Test Accuracy: {test_accuracy:.4f}")
+                llmp = vllm_instance.llm_engine.model_executor.driver_worker.model_runner.model
+                llmp.load_weights(posterior_model.named_parameters())
 
     #torch.save(train_model.state_dict(), "trained_qwen_policy.pt")
     #wandb.save("trained_qwen_policy.pt")
@@ -360,6 +420,7 @@ if __name__ == "__main__":
     parser.add_argument("--wandb_project", type=str, default="gsm8k_rl", help="wandb project name.")
     parser.add_argument("--beta", type=float, default=1.0, help="KL term weight for E-step")
     parser.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-1.5B-Instruct", help="Pretrained model name.")
+    parser.add_argument("--importance_weights", action='store_true', help="Importance weight for M-step.")
     
     args = parser.parse_args()
     
@@ -369,5 +430,6 @@ if __name__ == "__main__":
         num_trajectories=args.num_trajectories,
         wandb_project=args.wandb_project,
         model_name=args.model_name,
-        beta=args.beta
+        beta=args.beta,
+        importance_weights=args.importance_weights
     )
