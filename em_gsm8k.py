@@ -11,6 +11,7 @@ from vllm import LLM, SamplingParams
 import wandb
 from torch.utils.data import DataLoader, Dataset
 from sklearn.model_selection import train_test_split
+from torch.nn.utils import clip_grad_norm_
 import matplotlib.pyplot as plt
 
 # ----------------------------
@@ -111,7 +112,7 @@ def compute_log_prob_batch(model, tokenizer, full_texts, prompt_lengths):
     # For each sample i, we mask positions where:
     #    positions >= prompt_lengths[i]   and   positions < (seq_lengths[i] - 1)
     # (We subtract one because our pred_log_probs has length seq_length-1.)
-    mask = ((positions >= prompt_tensor-1) & (positions < (seq_lengths - 1))).float()
+    mask = ((positions >= prompt_tensor-1) & (positions < (seq_lengths - 1))).bfloat16()
     log_prob_sum = (pred_log_probs * mask).sum(dim=1)  # Sum for each sample, shape (B,)
     return log_prob_sum
 
@@ -180,10 +181,23 @@ def train_rl(
     num_trajectories=3,  # replicates per question
     wandb_project="gsm8k_rl",
     model_name='Qwen/Qwen2.5-1.5B-Instruct',
-    beta=0.03,
-    importance_weights=False
+    beta=1.0,
+    importance_weights=False,
+    only_M_step=False,
+    learning_rate=1e-6,
+    share_weights=False
 ):
-    wandb.init(project=wandb_project, name='gsm8k_em')
+    wandb.init(project=wandb_project, name='gsm8k_em_K_'+str(num_trajectories)+'_share_weights_'+str(share_weights)+'_iw_'+str(importance_weights)+'_M_only_'+str(only_M_step)+'_lr_'+str(learning_rate),
+            config={                 # everything below gets captured in the run config
+            "epochs": epochs,
+            "batch_size": batch_size,
+            "num_trajectories": num_trajectories,
+            "model_name": model_name,
+            "beta": beta,
+            "importance_weights": importance_weights,
+            "only_M_step": only_M_step,
+            "learning_rate": learning_rate
+        })
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     # Load and split dataset.
@@ -205,25 +219,30 @@ def train_rl(
     print("Loading Qwen model and tokenizer...")
     train_model = AutoModelForCausalLM.from_pretrained(
         model_name,
-        torch_dtype=torch.float16,
+        torch_dtype=torch.bfloat16,
         device_map="auto"
     )
     train_model.train()
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     
     # Create reference model copy (frozen).
-    posterior_model = copy.deepcopy(train_model)
-    #reference_model = copy.deepcopy(train_model)
-    #reference_model.eval()
+    if share_weights:
+        posterior_model = train_model
+    else:
+        posterior_model = copy.deepcopy(train_model)
     #for param in reference_model.parameters():
     #    param.requires_grad = False
 
-    #optimizer = AdamW(train_model.parameters(), lr=1e-6)
-    E_optimizer = AdamW(posterior_model.parameters(), lr=1e-6)
-    M_optimizer = AdamW(train_model.parameters(), lr=1e-6)
+    E_optimizer = AdamW(posterior_model.parameters(), lr=learning_rate)
+    if share_weights:
+        # Use the same optimizer for both E and M steps.
+        M_optimizer = E_optimizer
+    else:
+        # Separate optimizer for M step.
+        M_optimizer = AdamW(train_model.parameters(), lr=learning_rate)
     
     # Initialize vLLM instance (for generation).
-    vllm_instance = LLM(model_name, max_num_seqs=1024, gpu_memory_utilization=0.2)
+    vllm_instance = LLM(model_name, max_num_seqs=1024, gpu_memory_utilization=0.15)
     
     # Pre-training evaluation.
     print("Evaluating on test set (pre-training)...")
@@ -295,27 +314,30 @@ def train_rl(
                 reward = 1.0 if (extracted is not None and abs(extracted - gt) < 1e-6) else 0.0
                 rewards.append(reward)
             
-            rewards_tensor = torch.tensor(rewards, device=train_model.device, dtype=torch.float)
+            rewards_tensor = torch.tensor(rewards, device=train_model.device, dtype=torch.bfloat16)
             rewards_tensor = rewards_tensor.view(len(batch), num_trajectories)
             total_reward = total_reward + rewards_tensor.mean()
             if importance_weights:
                 iw_tensor = torch.zeros_like(rewards_tensor, device=train_model.device)
             
             # Prior log probs
-            with torch.no_grad():
-                prior_log_probs = compute_log_prob_batch(train_model, tokenizer, prior_texts, prior_prompt_lengths)
-                prior_log_probs = prior_log_probs.view(len(batch), num_trajectories)
+            #with torch.no_grad():
+            #    prior_log_probs = compute_log_prob_batch(train_model, tokenizer, prior_texts, prior_prompt_lengths)
+            #    prior_log_probs = prior_log_probs.view(len(batch), num_trajectories)
 
             # E-step loss
             E_loss_total = 0.0
             kl_total = 0.0
             for b in range(len(batch)):
+                with torch.no_grad():
+                    prior_log_probs = compute_log_prob_batch(train_model, tokenizer, prior_texts[b*num_trajectories:(b+1)*num_trajectories], prior_prompt_lengths[b*num_trajectories:(b+1)*num_trajectories])
+                    prior_log_probs = prior_log_probs.view(num_trajectories)
                 #post_log_probs = compute_log_prob_batch(train_model, tokenizer, post_texts[b*num_trajectories:(b+1)*num_trajectories], post_prompt_lengths[b*num_trajectories:(b+1)*num_trajectories])
                 post_log_probs = compute_log_prob_batch(posterior_model, tokenizer, post_texts[b*num_trajectories:(b+1)*num_trajectories], post_prompt_lengths[b*num_trajectories:(b+1)*num_trajectories])
                 post_log_probs = post_log_probs.view(num_trajectories)
                 
                 # Compute the REINFORCE loss.
-                kl = post_log_probs.detach() - prior_log_probs[b]
+                kl = post_log_probs.detach() - prior_log_probs#[b]
                 entropy_reward = rewards_tensor[b] - beta * (kl)
                 baseline = entropy_reward.mean()
                 advantages = (entropy_reward - baseline)
@@ -328,7 +350,9 @@ def train_rl(
                     iw_tensor[b] = torch.softmax(entropy_reward, dim=0)
             
             # Update parameters with E-step
-            E_optimizer.step()
+            torch.nn.utils.clip_grad_norm_(posterior_model.parameters(), max_norm=1.0)
+            if not only_M_step:
+                E_optimizer.step()
             E_optimizer.zero_grad()
             
             # M-step loss
@@ -346,12 +370,13 @@ def train_rl(
                 M_loss_total = M_loss_total + M_loss.item()
                 
             # Update parameters with M-step
+            torch.nn.utils.clip_grad_norm_(train_model.parameters(), max_norm=1.0)
             M_optimizer.step()
             M_optimizer.zero_grad()
             
             # Accumulate min and max importance weights for logging
             if importance_weights:
-                iw_tensor = iw_tensor.detach().cpu().numpy()
+                iw_tensor = iw_tensor.to(torch.float32).detach().cpu().numpy()
                 min_iw = iw_tensor.min(axis=1)
                 max_iw = iw_tensor.max(axis=1)
                 accum_min_hist += np.histogram(min_iw, bins=bin_edges)[0]
@@ -421,6 +446,9 @@ if __name__ == "__main__":
     parser.add_argument("--beta", type=float, default=1.0, help="KL term weight for E-step")
     parser.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-1.5B-Instruct", help="Pretrained model name.")
     parser.add_argument("--importance_weights", action='store_true', help="Importance weight for M-step.")
+    parser.add_argument("--only_M_step", action='store_true', help="Only M-step training.")
+    parser.add_argument("--learning_rate", type=float, default=1e-6, help="Learning rate for the optimizer.")
+    parser.add_argument("--share_weights", action='store_true', help="Share weights between E and M steps.")
     
     args = parser.parse_args()
     
@@ -431,5 +459,8 @@ if __name__ == "__main__":
         wandb_project=args.wandb_project,
         model_name=args.model_name,
         beta=args.beta,
-        importance_weights=args.importance_weights
+        importance_weights=args.importance_weights,
+        only_M_step=args.only_M_step,
+        learning_rate=args.learning_rate,
+        share_weights=args.share_weights
     )
