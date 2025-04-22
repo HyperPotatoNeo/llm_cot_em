@@ -11,7 +11,6 @@ from vllm import LLM, SamplingParams
 import wandb
 from torch.utils.data import DataLoader, Dataset
 from sklearn.model_selection import train_test_split
-from torch.nn.utils import clip_grad_norm_
 import matplotlib.pyplot as plt
 
 # ----------------------------
@@ -441,13 +440,13 @@ if __name__ == "__main__":
     )
     parser.add_argument("--epochs", type=int, default=10, help="Number of training epochs.")
     parser.add_argument("--batch_size", type=int, default=6, help="Batch size (number of questions per batch).")
-    parser.add_argument("--num_trajectories", type=int, default=5, help="Number of trajectories per question.")
+    parser.add_argument("--num_trajectories", type=int, default=8, help="Number of trajectories per question.")
     parser.add_argument("--wandb_project", type=str, default="gsm8k_rl", help="wandb project name.")
     parser.add_argument("--beta", type=float, default=1.0, help="KL term weight for E-step")
     parser.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-1.5B-Instruct", help="Pretrained model name.")
     parser.add_argument("--importance_weights", action='store_true', help="Importance weight for M-step.")
     parser.add_argument("--only_M_step", action='store_true', help="Only M-step training.")
-    parser.add_argument("--learning_rate", type=float, default=1e-6, help="Learning rate for the optimizer.")
+    parser.add_argument("--learning_rate", type=float, default=1e-5, help="Learning rate for the optimizer.")
     parser.add_argument("--share_weights", action='store_true', help="Share weights between E and M steps.")
     
     args = parser.parse_args()
