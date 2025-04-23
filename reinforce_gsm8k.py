@@ -171,9 +171,10 @@ def train_rl(
     batch_size=4,        # number of questions per batch
     num_trajectories=3,  # replicates per question
     wandb_project="gsm8k_rl",
-    model_name='Qwen/Qwen2.5-1.5B-Instruct'
+    model_name='Qwen/Qwen2.5-1.5B-Instruct',
+    learning_rate=1e-6
 ):
-    wandb.init(project=wandb_project, name="gsm8k_reinforce")
+    wandb.init(project=wandb_project, name="gsm8k_reinforce_lr_"+str(learning_rate))
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     # Load and split dataset.
@@ -207,7 +208,7 @@ def train_rl(
     #for param in reference_model.parameters():
     #    param.requires_grad = False
 
-    optimizer = AdamW(train_model.parameters(), lr=5e-7)
+    optimizer = AdamW(train_model.parameters(), lr=learning_rate)
     
     # Initialize vLLM instance (for generation).
     vllm_instance = LLM(model_name, max_num_seqs=1024, gpu_memory_utilization=0.25)
@@ -316,6 +317,7 @@ if __name__ == "__main__":
     parser.add_argument("--num_trajectories", type=int, default=5, help="Number of trajectories per question.")
     parser.add_argument("--wandb_project", type=str, default="gsm8k_rl", help="wandb project name.")
     parser.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-1.5B-Instruct", help="Pretrained model name.")
+    parser.add_argument("--learning_rate", type=float, default=1e-6, help="Learning rate for the optimizer.")
     
     args = parser.parse_args()
     
@@ -324,5 +326,6 @@ if __name__ == "__main__":
         batch_size=args.batch_size,
         num_trajectories=args.num_trajectories,
         wandb_project=args.wandb_project,
-        model_name=args.model_name
+        model_name=args.model_name,
+        learning_rate=args.learning_rate
     )

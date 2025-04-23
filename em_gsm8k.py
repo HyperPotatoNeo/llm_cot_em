@@ -181,12 +181,12 @@ def train_rl(
     wandb_project="gsm8k_rl",
     model_name='Qwen/Qwen2.5-1.5B-Instruct',
     beta=1.0,
-    importance_weights=False,
+    importance_weights=None,
     only_M_step=False,
     learning_rate=1e-6,
     share_weights=False
 ):
-    wandb.init(project=wandb_project, name='gsm8k_em_K_'+str(num_trajectories)+'_share_weights_'+str(share_weights)+'_iw_'+str(importance_weights)+'_M_only_'+str(only_M_step)+'_lr_'+str(learning_rate),
+    wandb.init(project=wandb_project, name='gsm8k_em_K_'+str(num_trajectories)+'_share_weights_'+str(share_weights)+'_iw_'+str(importance_weights)+'_M_only_'+str(only_M_step)+'_beta_'+str(beta)+'_lr_'+str(learning_rate),
             config={                 # everything below gets captured in the run config
             "epochs": epochs,
             "batch_size": batch_size,
@@ -251,7 +251,7 @@ def train_rl(
     
     global_step = 0
     total_reward = 0.0
-    if importance_weights:
+    if importance_weights is not None:
         accum_min_hist = np.zeros(10, dtype=int)
         accum_max_hist = np.zeros(10, dtype=int)
         bin_edges = np.linspace(0, 1, 11)
@@ -316,7 +316,7 @@ def train_rl(
             rewards_tensor = torch.tensor(rewards, device=train_model.device, dtype=torch.bfloat16)
             rewards_tensor = rewards_tensor.view(len(batch), num_trajectories)
             total_reward = total_reward + rewards_tensor.mean()
-            if importance_weights:
+            if importance_weights is not None:
                 iw_tensor = torch.zeros_like(rewards_tensor, device=train_model.device)
             
             # Prior log probs
@@ -345,8 +345,14 @@ def train_rl(
                 E_loss_total = E_loss_total + E_loss.item()
                 kl_total = kl_total + kl.mean()
                 # Compute importance weights.
-                if importance_weights:
-                    iw_tensor[b] = torch.softmax(entropy_reward, dim=0)
+                if importance_weights is not None:
+                    if importance_weights == "soft_filter":
+                        iw_tensor[b] = torch.softmax(entropy_reward, dim=0)
+                    elif importance_weights == "hard_filter":
+                        advantages = (rewards_tensor[b] - rewards_tensor[b].mean()) / (rewards_tensor[b].std() + 1e-8)
+                        iw_tensor[b] = advantages * torch.exp(-kl)
+                        # standardize the importance weights
+                        #iw_tensor[b] = iw_tensor[b] / (iw_tensor[b].std() + 1e-8)
             
             # Update parameters with E-step
             torch.nn.utils.clip_grad_norm_(posterior_model.parameters(), max_norm=1.0)
@@ -361,8 +367,8 @@ def train_rl(
                 prior_log_probs = prior_log_probs.view(num_trajectories)
                 
                 # Fiter out wrong answers and maximize log prob for rest
-                if importance_weights:
-                    M_loss = - (iw_tensor[b] * prior_log_probs).sum()#mean()
+                if importance_weights is not None:
+                    M_loss = - (iw_tensor[b] * prior_log_probs).mean()#sum()#mean()
                 else:
                     M_loss = - (rewards_tensor[b] * prior_log_probs).mean()
                 M_loss.backward()
@@ -374,7 +380,7 @@ def train_rl(
             M_optimizer.zero_grad()
             
             # Accumulate min and max importance weights for logging
-            if importance_weights:
+            if importance_weights is not None:
                 iw_tensor = iw_tensor.to(torch.float32).detach().cpu().numpy()
                 min_iw = iw_tensor.min(axis=1)
                 max_iw = iw_tensor.max(axis=1)
@@ -399,7 +405,7 @@ def train_rl(
 
             if global_step % 50 == 0:
                 # Log importance weights histogram
-                if importance_weights:
+                if importance_weights is not None:
                     fig, ax = plt.subplots(figsize=(10, 6))
                     width = (bin_edges[1] - bin_edges[0]) * 0.4
                     bins_center = (bin_edges[:-1] + bin_edges[1:]) / 2
@@ -444,12 +450,14 @@ if __name__ == "__main__":
     parser.add_argument("--wandb_project", type=str, default="gsm8k_rl", help="wandb project name.")
     parser.add_argument("--beta", type=float, default=1.0, help="KL term weight for E-step")
     parser.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-1.5B-Instruct", help="Pretrained model name.")
-    parser.add_argument("--importance_weights", action='store_true', help="Importance weight for M-step.")
+    parser.add_argument("--importance_weights", type=str, choices=["none", "soft_filter", "hard_filter"], default="none", help="Type of importance weighting for M-step. Options: 'none', 'soft_filter', 'hard_filter'.")
     parser.add_argument("--only_M_step", action='store_true', help="Only M-step training.")
     parser.add_argument("--learning_rate", type=float, default=1e-5, help="Learning rate for the optimizer.")
     parser.add_argument("--share_weights", action='store_true', help="Share weights between E and M steps.")
     
     args = parser.parse_args()
+    if args.importance_weights == "none":
+        args.importance_weights = None
     
     train_rl(
         epochs=args.epochs,
