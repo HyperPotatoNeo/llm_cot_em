@@ -6,7 +6,8 @@ import json
 import numpy as np
 import re
 from datasets import load_dataset
-from transformers import AutoModelForCausalLM, AutoTokenizer, AdamW
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from torch.optim import AdamW
 from vllm import LLM, SamplingParams
 import wandb
 from torch.utils.data import DataLoader, Dataset
@@ -186,7 +187,7 @@ def train_rl(
     learning_rate=1e-6,
     share_weights=False
 ):
-    wandb.init(project=wandb_project, name='gsm8k_em_K_'+str(num_trajectories)+'_share_weights_'+str(share_weights)+'_iw_'+str(importance_weights)+'_M_only_'+str(only_M_step)+'_beta_'+str(beta)+'_lr_'+str(learning_rate),
+    wandb.init(project=wandb_project, name=model_name+'_gsm8k_em_K_'+str(num_trajectories)+'_share_weights_'+str(share_weights)+'_iw_'+str(importance_weights)+'_M_only_'+str(only_M_step)+'_beta_'+str(beta)+'_lr_'+str(learning_rate),
             config={                 # everything below gets captured in the run config
             "epochs": epochs,
             "batch_size": batch_size,
@@ -452,7 +453,7 @@ if __name__ == "__main__":
     parser.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-1.5B-Instruct", help="Pretrained model name.")
     parser.add_argument("--importance_weights", type=str, choices=["none", "soft_filter", "hard_filter"], default="none", help="Type of importance weighting for M-step. Options: 'none', 'soft_filter', 'hard_filter'.")
     parser.add_argument("--only_M_step", action='store_true', help="Only M-step training.")
-    parser.add_argument("--learning_rate", type=float, default=1e-5, help="Learning rate for the optimizer.")
+    parser.add_argument("--learning_rate", type=float, default=3e-6, help="Learning rate for the optimizer.")
     parser.add_argument("--share_weights", action='store_true', help="Share weights between E and M steps.")
     
     args = parser.parse_args()
